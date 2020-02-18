@@ -1,0 +1,97 @@
+import Route from '@ember/routing/route';
+import { inject as service } from '@ember/service';
+
+const PAGE_LIMIT = 5;
+
+export default Route.extend({
+  session: service(),
+  loadMoreURL: null,
+  parseGitHubResponse: async function(response) {
+    const repositories = await response.json();
+    const links = response.headers.get('link');
+    if (links) {
+      // Get next page request url.
+      links.split(',').find(link => {
+        if (/rel="next"/.test(link)) {
+          const { url } = link.match(/<(?<url>.*)>/).groups;
+          this.set('loadMoreURL', url);
+          return true;
+        } else {
+          this.set('loadMoreURL', null);
+        }
+      });
+    }
+
+    const reposWithBranches = await Promise.all(
+      repositories.map(async repo => {
+        const branchesResponse = await this.fetchWithToken(`https://api.github.com/repos/${repo.owner.login}/${repo.name}/branches`);
+        if (branchesResponse.status === 200) {
+          const branches = await branchesResponse.json();
+          return { ...repo, branches };
+        } else if (branchesResponse.status === 403) {
+          throw new Error(`Rate limit exeded! Try again in an hour.`);
+        } else {
+          throw new Error(`Error getting branches for "${repo.name}"`);
+        }
+      })
+    );
+    return reposWithBranches;
+  },
+
+  fetchWithToken: function(url) {
+    const authToken = this.get('session.token');
+    return fetch(url, {
+      headers: {
+        Authorization: authToken ? `token ${authToken}` : null,
+      },
+    });
+  },
+
+  async model(params) {
+    const searchResponse = await this.fetchWithToken(`https://api.github.com/orgs/${params.name}/repos?per_page=${PAGE_LIMIT}`);
+    if (searchResponse.status === 200) {
+      const repositories = await this.parseGitHubResponse(searchResponse);
+      return repositories;
+    } else if (searchResponse.status === 404) {
+      throw new Error(`No repositories found!`);
+    } else if (searchResponse.status === 403) {
+      throw new Error(`Rate limit exeded! Try again in an hour.`);
+    } else {
+      throw new Error(`Error getting repositories for "${params.name}"`);
+    }
+  },
+  setupController(controller) {
+    this._super(...arguments);
+    controller.set('canLoadMore', this.get('loadMoreURL') !== null);
+  },
+  actions: {
+    async loadMoreRepositories() {
+      try {
+        this.set('page', this.page + 1);
+        this.controller.set('isLoadingMore', true);
+
+        this.isLoadingMore = true;
+        const loadMoreResponse = await this.fetchWithToken(this.loadMoreURL);
+        if (loadMoreResponse.status === 200) {
+          const repositories = await this.parseGitHubResponse(loadMoreResponse);
+          this.controller.set('model', [...this.controller.get('model'), ...repositories]);
+          this.controller.set('canLoadMore', this.get('loadMoreURL') !== null);
+        } else {
+          this.set('page', this.page - 1);
+          this.controller.set('errorMessage', 'Error loading more repositories!');
+        }
+        this.controller.set('isLoadingMore', false);
+      } catch (error) {
+        this.set('page', this.page - 1);
+        this.controller.set('errorMessage', error);
+        this.controller.set('isLoadingMore', false);
+      }
+    },
+    error(error, transition) {
+      // Fixes url to mach organization name input.
+      transition.router.updateURL(transition.router.generate(transition.targetName, transition.to.parent.params.name));
+      return true;
+    },
+  },
+});
+
